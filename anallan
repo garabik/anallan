@@ -1,0 +1,524 @@
+#!/usr/bin/python3
+
+import sys, re, subprocess, time
+from random import random, randint, choice
+import socket, struct, fcntl
+import binascii
+
+from pprint import pprint
+
+import threading
+from queue import Queue, Empty
+
+
+try:
+    from argparse import ArgumentParser
+    using_optparse = False
+except ImportError:
+    from optparse import OptionParser as ArgumentParser
+    using_optparse = True
+
+
+machines = {} # mac: {ipv4:xxx, ipv6:xxx}
+
+def get_ipv6_addrs():
+    output = subprocess.getoutput('ip -6 neigh show')
+    r = {}
+    for line in output.splitlines():
+        l = line.strip()
+        if l.endswith('FAILED') or l.endswith('INCOMPLETE'):
+            continue
+        ip6, dummy, iface, dummy, mac, rest = l.split(None, 5)
+        if (mac in r) and ip6.startswith('fe80'): # do not overwrite good ipv6 with link-local
+            continue
+        r[mac] = ip6
+    return r
+
+def get_ipv4_addrs():
+    "list of mac and ipv4 addresses in ARP cache"
+    output = subprocess.getoutput('ip -4 neigh show')
+    r = {}
+    for line in output.splitlines():
+        l = line.strip()
+        if l.endswith('FAILED') or l.endswith('INCOMPLETE'):
+            continue
+        ip, dummy, iface, dummy, mac, rest = l.split(None, 5)
+        status = rest
+        r[mac] = (ip, status)
+    return r
+
+def nmblookup(ip):
+    status, output = subprocess.getstatusoutput('nmblookup -A '+str(ip))
+    if status != 0: # error
+        return None
+    lookup_lines = output.splitlines()
+    lines = [x.strip() for x in lookup_lines]
+    lines = [x.split(None, 1) for x in lines] # separate NAME from the rest
+    lines = [x for x in lines if len(x)==2]
+    # separate those entries with <GROUP>
+    grouplines = [x for x in lines if '<GROUP>' in x[1]]
+    namelines  = [x for x in lines if '<GROUP>' not in x[1]]
+
+    names = set(x[0] for x in namelines if '<00>' in x[1] or '<20>' in x[1])
+    groups = set(x[0] for x in grouplines if '<00>' in x[1] or '<20>' in x[1])
+
+    name = ','.join(names)
+    domain = ','.join(groups)
+
+    macaddr = None
+    for l in lookup_lines:
+        if 'MAC Address =' in l:
+            macaddr = l.split('=')[1].strip().lower().replace('-', ':')
+            macaddr = macaddr.lower()
+    if not (name or domain or macaddr):
+        return None
+    return name, macaddr, domain, ''
+
+def nmbscan(ip):
+    status, output = subprocess.getstatusoutput('/usr/sbin/nmbscan -h '+str(ip))
+    if status != 0:
+        return
+    lines = output.splitlines()
+    lines = [x.strip() for x in lines]
+    data = {}
+    for l in lines:
+        if ' ' in l:
+            k, v = l.split(' ', 1)
+            k = k.strip(); v = v.strip()
+            data[k] = v
+    domain = data.get('domain', '')
+    name = data.get('server', '')
+    macaddr = data.get('arp-mac-address', '').lower()
+    os = data.get('operating-system', '')
+    return name, macaddr, domain, os
+
+def ipv4pinger(ip):
+    print('{} {:<15}'.format(choice('/\-|'), ip), file=sys.stderr, end='\r'); sys.stderr.flush()
+    # discard the output
+    subprocess.getoutput('ping -c 2 -n '+str(ip))
+    print(' ',ip, file=sys.stderr, end='    \r'); sys.stderr.flush()
+
+
+def nmbinfo(ip, nmbmachines):
+    time.sleep(4*random())
+    print('{} {:<15}'.format(choice('/\-|'), ip), file=sys.stderr, end='\r'); sys.stderr.flush()
+    nmbl = nmblookup(ip)
+    if nmbl is not None:
+        name, macaddr, domain, os = nmbl
+        nmbmachines[ip] = macaddr, name, domain, os
+    print(' ',ip, file=sys.stderr, end='    \r'); sys.stderr.flush()
+
+def lan4_map(live_addrs, utf8=True):
+    # return ASCII map of online computers
+    # live_addrs is a list of living computers
+    live_addrs = set(live_addrs)
+    blocks256 = set(x.rsplit('.',1)[0] for x in live_addrs)
+    for block in sorted(blocks256):
+        print('{:<16}'.format(block+'.~'), end='')
+        for subrow in range(1,8):
+            print('~+{:<7}'.format(subrow*8), end='')
+        print()
+        for row in range(4): # 64 addresses each row
+            ip = '~.'+str(row*64)
+            c = '│' if utf8 else '|'
+            print('{:<5}'.format(ip), end=' '+c)
+            for subrow in range(8): # 8 addresses each subrow
+                for col in range(8):
+                    byte = row*64+subrow*8+col
+                    ip = block+'.'+str(byte)
+                    if ip in live_addrs:
+                        c = '×' if utf8 else 'x'
+                    else:
+                        c = '·' if utf8 else '.'
+                    print(c, end = '')
+                c = '│' if utf8 else '|'
+                print(c, end = '')
+            print()
+        print()
+
+def ipv6pinger(iface, ipaddr):
+    # wake up ipv6 link local machines
+    subprocess.getstatusoutput('ping6 -c 2 -I {iface} ff02::1'.format(iface=iface))
+    subprocess.getstatusoutput('ping6 -c 3 -B -I {ipaddr} ff02::1'.format(iface=iface, ipaddr=ipaddr))
+
+def get_ip4_address(ifname):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ip = socket.inet_ntoa(fcntl.ioctl(
+           s.fileno(),
+           0x8915,  # SIOCGIFADDR
+           struct.pack('256s', ifname[:15].encode('ascii'))
+         )[20:24])
+    except OSError: # e.g. no IPv4 address
+        ip = None
+    return ip
+
+def get_ip6_address(ifname):
+    # returns address disregarding the interface
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    try:
+        s.connect(('2001::1', 9))
+        ip = s.getsockname()[0]
+    except OSError:
+        ip = None
+    return ip
+
+def get_netmask4(ifname):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    mask = socket.inet_ntoa(fcntl.ioctl(
+            s, 0x891b,
+            struct.pack('256s', ifname[:15].encode('ascii'))
+        )[20:24])
+    return mask
+
+stopped_threads = threading.Event()
+
+def worker(q, work, *args):
+    while not stopped_threads.is_set():
+        try:
+            item = q.get_nowait()
+            time.sleep(random())
+            work(item, *args)
+            q.task_done()
+        except Empty:
+            stopped_threads.wait(1)
+
+def mask2cidr(mask):
+    'convert dotted netmask (e.g. 255.255.255.0) into cidr (e.g. 24)'
+    return sum([bin(int(x)).count('1') for x in mask.split('.')])
+
+def ipv4range(ipaddr, cidr):
+    'return iterator through all the ip addresses'
+    ip32 = socket.inet_aton(ipaddr)
+    ip32 = struct.unpack('!I', ip32)[0]
+    mask = 0xffffffff<<(32-cidr) # subnet mask
+    low_ip = ip32 & mask
+    high_ip = ip32 | (~mask & 0xffffffff)
+    for ip in range(low_ip+1, high_ip):
+        yield socket.inet_ntoa(struct.pack('!I', ip))
+
+def ping4_subnet(ip, cidr):
+    q = Queue()
+
+    for i in range(max_threads):
+        t = threading.Thread(target=worker, args=(q,ipv4pinger))
+        t.daemon = True
+        t.start()
+
+    for ip in ipv4range(ip, cidr):
+        q.put(ip)
+
+    # give CTRL+C a chance to propagate, q.join would block
+    while q.qsize() > 0:
+        time.sleep(0.1)
+
+    # but wait for any leftover tasks
+    q.join()
+
+    # and signal to the workers to exit
+    stopped_threads.set()
+
+def nmb_subnet(ips, nmbmachines):
+    # nmbmachines is modified
+    q = Queue()
+
+    stopped_threads.clear()
+    for i in range(max_threads):
+        t= threading.Thread(target=worker, args=(q,nmbinfo,nmbmachines))
+        t.daemon = True
+        t.start()
+
+    for ip in ips:
+        q.put(ip)
+
+    # give CTRL+C a chance to propagate, q.join would block
+    while q.qsize() > 0:
+        time.sleep(0.1)
+
+    # but wait for any leftover tasks
+    q.join()
+
+    # and signal to the workers to exit
+    stopped_threads.set()
+
+def ip_sort_key(x):
+    if x is None:
+        return 0
+    try:
+        if '.' in x:
+            return struct.unpack('!I', socket.inet_aton(x))[0]
+        elif ':' in x:
+            return socket.inet_pton(socket.AF_INET6, x)
+    except socket.error:
+        pass
+    return x
+
+def blockify(ip6s, level):
+    blocks = {} # block prefix (8 bits): [list of ips]
+    for i in ip6s:
+        block = i >> (8*level)
+        if block in blocks:
+            blocks[block].add(i>>(8*(level-1)))
+        else:
+            blocks[block] = {i>>(8*(level-1))}
+    return blocks
+
+def lan6_map(ip6s):
+    ip6s = [int(binascii.hexlify(socket.inet_pton(socket.AF_INET6, x)), 16) for x in ip6s]
+    # top 16 bits
+    prefixes = set(x>>112 for x in ip6s)
+    for prefix in prefixes:
+        print('{:x}:'.format(prefix))
+        ips_by_prefix = [x for x in ip6s if x>>112==prefix]
+        ips_by_prefix = [x & ((1<<112)-1) for x in ips_by_prefix]
+        # fold ips on themselves, keeping just last 8 bits intact
+        hshs = []
+        for ip in ips_by_prefix:
+            hsh = 0
+            last_byte = ip & 0xff
+            rest = ip >> 8
+            while ip:
+                hsh ^= ip & 0xf # hash last 4 bits
+                ip = ip >> 4 # and remove them
+            hsh = (hsh << 8) + last_byte # maximum possible value 4095
+            hshs.append(hsh)
+        for row in range(4):
+            for column in range(64):
+                n = 0 # number of ips in this cell
+                for cnt in range(16):
+                    hsh = cnt + 16*column + 1024*row
+                    if hsh in hshs:
+                        n += 1
+                if n>0:
+                    c = '{:x}'.format(n)
+                else:
+                    c = '.'
+                print(c, end='')
+            print()
+
+def lan6_map_old(ip6s):
+    ip6s = [int(binascii.hexlify(socket.inet_pton(socket.AF_INET6, x)), 16) for x in ip6s]
+    utf8 = True
+
+    for level in range(1, 16):
+        blocks = blockify(ip6s, level)
+        for block in sorted(blocks.keys()):
+            ips = set(blocks[block])
+            if level != 14 and len(ips) < 5:
+                continue
+    #        print('ips',' '.join('{:x}'.format(x) for x in ips))
+            print('{:<16x}: .=2**{} IPs'.format(block, (8*(level-1))))
+            for subrow in range(1,8):
+                print('~+{:<7x}'.format(subrow*8), end='')
+            print()
+            for row in range(4): # 64 addresses each row
+                ip = row*64
+                c = '│' if utf8 else '|'
+                print(':{:<2x}'.format(ip), end=' '+c)
+                for subrow in range(8): # 8 addresses each subrow
+                    for col in range(8):
+                        byte = row*64+subrow*8+col
+                        ip = (block << 8) + byte
+    #                    print('fasz {:x}'.format(ip))
+                        if ip in ips:
+                            c = '×' if utf8 else 'x'
+                        else:
+                            c = '·' if utf8 else '.'
+                        print(c, end = '')
+                    c = '│' if utf8 else '|'
+                    print(c, end = '')
+                print()
+            print()
+
+
+if __name__ == '__main__':
+
+    parser = ArgumentParser(
+            description='Scan the network')
+    if using_optparse:
+        parser.add_argument = parser.add_option
+
+    parser.add_argument('--interface', '-i', '-I',  dest='ifname', action='store',
+                       type=str, default='eth0',
+                       help='network interface, default eth0')
+
+    parser.add_argument('--ip4', dest='ip4', action='store',
+                       type=str, default='autodetect',
+                       help='IPv4/mask,  e.g. 192.168.0.1/24, default: autodetect')
+
+    parser.add_argument('--ip6', dest='ip6', action='store',
+                       type=str, default='autodetect',
+                       help='IPv6/mask,  e.g. 2001:db8::/64, default: autodetect')
+
+
+    parser.add_argument('--probe-all4', dest='probe_all4', action='store',
+                       default='auto', # yes, no, auto
+                       type=str,
+                       help='probe all the IPv4 numbers in subnet range (yes/no), default: yes if less than 256')
+
+    parser.add_argument('--ping4', dest='ping4', action='store',
+                       default='auto', # yes, no, auto
+                       type=str,
+                       help='ping all the IPv4 numbers in subnet range before starting (yes/no), default: yes')
+
+    parser.add_argument('--ping6', dest='ping6', action='store',
+                       default='yes', # yes, no
+                       type=str,
+                       help='ping IPv6 broadcast before starting (yes/no), default: yes')
+
+    parser.add_argument('--ip4map', dest='ip4map', action='store',
+                       default='yes', # yes, no, auto
+                       type=str,
+                       help='show ASCII map of active IPv4 computers (yes/no), default: yes')
+
+    parser.add_argument('--probe-nmb', dest='probe_nmb', action='store',
+                       default='yes', # yes, no
+                       type=str,
+                       help='probe computers for NetBios info (yes/no), default: yes')
+
+    parser.add_argument('--max-threads', dest='max_threads', action='store',
+                       default=120,
+                       type=int,
+                       help='maximum number of threads for parallel ping & scan (default: 120)')
+
+
+    args = parser.parse_args()
+    if using_optparse:
+        args = args[0]
+
+    ifname = args.ifname
+    if args.ip4 == 'autodetect':
+        ip4_addr = get_ip4_address(ifname)
+        cidr = None
+        if ip4_addr:
+            ip4_mask = get_netmask4(ifname)
+            cidr = mask2cidr(ip4_mask)
+    else:
+        ip4_addr, cidr = args.ip4.split('/')
+        cidr = int(cidr)
+
+    if args.ip6 == 'autodetect':
+        ip6_addr = get_ip6_address(ifname)
+#        ip6_mask = get_netmask6(ifname)
+#        cidr6 = mask2cidr(ip4_mask)
+        cidr6 = 64
+    else:
+        ip6_addr, cidr6 = args.ip6.split('/')
+        cidr6 = int(cidr6)
+
+
+    max_threads = args.max_threads
+
+    if args.ping4 == 'auto' and ip4_addr:
+        ping4 = cidr >= 24 # less than 256 hosts
+    elif args.ping4.startswith('y'):
+        ping4 = True
+    else:
+        ping4 = False
+
+    if args.ping6.startswith('y'):
+        ping6 = True
+    else:
+        ping6 = False
+
+    if args.ip4map.startswith('y'):
+        ip4map = True
+    else:
+        ip4map = False
+
+    if args.probe_nmb.startswith('y'):
+        probe_nmb = True
+    else:
+        probe_nmb = False
+
+
+    probe_all4 = args.probe_all4
+    if probe_all4 == 'auto' and ip4_addr:
+        probe_all4 = cidr >= 24 # less than 256 hosts
+    elif probe_all4.startswith('y'):
+        probe_all4 = True
+    else:
+        probe_all4 = False
+
+
+
+    print('Interface: {ifname}, IPv4: {ip4_addr}/{cidr}, IPv6: {ip6_addr}/{cidr6}'.format(**locals()))
+
+    ipv4machines = get_ipv4_addrs()
+    print('found {m} IPv4 machines in ARP cache'.format(m=len(ipv4machines)))
+
+
+    if ping4:
+        print('pinging the IPv4 LAN to fill ARP cache')
+        ping4_subnet(ip4_addr, cidr)
+
+        ipv4machines = get_ipv4_addrs()
+        print('After ping, found {m} IPv4 machines in ARP cache'.format(m=len(ipv4machines)))
+
+    if ip4map:
+        print()
+        lan4_map(x[0] for x in ipv4machines.values())
+        print()
+
+    ipv6machines = get_ipv6_addrs()
+    print('found {m} IPv6 machines in ARP cache'.format(m=len(ipv6machines)))
+    if ping6:
+        ipv6pinger(ifname, ip6_addr)
+        print('after ping, found {m} IPv6 machines in ARP cache'.format(m=len(ipv6machines)))
+
+    lan6_map(ipv6machines.values())
+
+    # key: ipv4, value (mac, smbname, smbdomain, os)
+    nmbmachines = {}
+
+    if probe_nmb:
+        print('getting nbm info')
+
+        if probe_all4:
+            nmb_ips = ipv4range(ip4_addr, cidr)
+        else:
+            nmb_ips = (x[0] for x in ipv4machines.values())
+
+        nmb_subnet(nmb_ips, nmbmachines)
+
+
+    # key:mac, val: ipv4, ipv6, smbname, smbdomain, os
+    machines = {}
+    # combination of mac and ipv address, because nmbinfo sometimes returns unreliable (=zero) MAC
+    mac_ip = set( (x[0], x[1][0]) for x in ipv4machines.items() ) | \
+              set( (x[0], x[1]) for x in ipv6machines.items() ) | \
+              set( (x[1][0], x[0]) for x in nmbmachines.items() )
+    for mac, ip in mac_ip:
+        v = ipv4machines.get(mac, (None, ''))
+        ipv4, ipv4_state = v
+        ipv6 = ipv6machines.get(mac, '')
+        if ipv4:
+            ip_for_nmb = ipv4
+        else:
+            ip_for_nmb = ip
+        smbmac, smbname, smbdomain, smbos = nmbmachines.get(ip_for_nmb, ('','','',''))
+        if ip_for_nmb in nmbmachines:
+            del nmbmachines[ip_for_nmb]
+        machines[mac] = ipv4, ipv6, smbname, smbdomain, smbos
+
+    machines_table = []
+    for mac, v in machines.items():
+        row = [mac] + list(v)
+        machines_table.append(row)
+
+    machines_table = sorted(machines_table, key=lambda x: ip_sort_key(x[1]))
+
+    def format_os(os):
+        return os.replace('Windows 7', 'W7').replace('Service Pack ', 'SP').replace('Professional', 'Prof')
+
+    print ( '      mac        |     ipv4      |  smbname/wgrp    | ipv6 | *os ')
+    print('-'*40)
+    for row in machines_table:
+        mac, ipv4, ipv6, smbname, smbdomain, smbos = row
+        if smbdomain or smbname:
+            smbnamedomain = smbdomain+'/'+smbname
+        else:
+            smbnamedomain = ''
+        os = format_os(smbos)
+        print( '{mac} {ipv4:<15} {smbnamedomain:<13} \t{ipv6}\t*{os}'.format(**locals()))
+

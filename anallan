@@ -92,6 +92,10 @@ def nmbscan(ip):
     os = data.get('operating-system', '')
     return name, macaddr, domain, os
 
+def test_nmblookup_nmbscan():
+    # detect which one is installed: nmbscan, nmblookup
+    return nmblookup
+
 def ipv4pinger(ip):
     print('{} {:<15}'.format(choice('/\-|'), ip), file=sys.stderr, end='\r'); sys.stderr.flush()
     # discard the output
@@ -102,7 +106,7 @@ def ipv4pinger(ip):
 def nmbinfo(ip, nmbmachines):
     time.sleep(4*random())
     print('{} {:<15}'.format(choice('/\-|'), ip), file=sys.stderr, end='\r'); sys.stderr.flush()
-    nmbl = nmblookup(ip)
+    nmbl = probe_nmb(ip)
     if nmbl is not None:
         name, macaddr, domain, os = nmbl
         nmbmachines[ip] = macaddr, name, domain, os
@@ -138,8 +142,12 @@ def lan4_map(live_addrs, utf8=True):
 
 def ipv6pinger(iface, ipaddr):
     # wake up ipv6 link local machines
-    subprocess.getstatusoutput('ping6 -c 2 -I {iface} ff02::1'.format(iface=iface))
-    subprocess.getstatusoutput('ping6 -c 3 -B -I {ipaddr} ff02::1'.format(iface=iface, ipaddr=ipaddr))
+    for i in range(0, 2):
+        subprocess.getstatusoutput('ping6 -c 1 -I {iface} ff02::1'.format(iface=iface))
+        subprocess.getstatusoutput('ping6 -c 2 -B -I {ipaddr} ff02::1'.format(iface=iface, ipaddr=ipaddr))
+        print('.', end='', file=sys.stderr); sys.stderr.flush()
+        time.sleep(0.2)
+    print('\r     ',end='\r', file=sys.stderr)
 
 def get_ip4_address(ifname):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -374,9 +382,9 @@ if __name__ == '__main__':
                        help='show ASCII map of active IPv4 computers (yes/no), default: yes')
 
     parser.add_argument('--probe-nmb', dest='probe_nmb', action='store',
-                       default='yes', # yes, no
+                       default='auto', 
                        type=str,
-                       help='probe computers for NetBios info (yes/no), default: yes')
+                       help='probe computers for NetBios info (nmblookup/nmbscan/auto/no), default: auto')
 
     parser.add_argument('--max-threads', dest='max_threads', action='store',
                        default=120,
@@ -428,10 +436,14 @@ if __name__ == '__main__':
     else:
         ip4map = False
 
-    if args.probe_nmb.startswith('y'):
-        probe_nmb = True
-    else:
-        probe_nmb = False
+    if args.probe_nmb=='nmblookup':
+        probe_nmb = nmblookup
+    elif args.probe_nmb=='nmbscan':
+        probe_nmb = nmbscan
+    elif args.probe_nmb=='no':
+        probe_nmb = None
+    elif args.probe_nmb=='auto':
+        probe_nmb = test_nmblookup_nmbscan()
 
 
     probe_all4 = args.probe_all4

@@ -249,6 +249,8 @@ def ip_sort_key(x):
             return struct.unpack('!I', socket.inet_aton(x))[0]
         elif ':' in x:
             return socket.inet_pton(socket.AF_INET6, x)
+        else:
+            return -1
     except socket.error:
         pass
     return x
@@ -489,9 +491,9 @@ if __name__ == '__main__':
               set( (x[0], x[1]) for x in ipv6machines.items() ) | \
               set( (x[1][0], x[0]) for x in nmbmachines.items() )
     for mac, ip in mac_ip:
-        v = ipv4machines.get(mac, (None, ''))
+        v = ipv4machines.get(mac, ('N/A', ''))
         ipv4, ipv4_state = v
-        ipv6 = ipv6machines.get(mac, '')
+        ipv6 = ipv6machines.get(mac, 'N/A')
         if ipv4:
             ip_for_nmb = ipv4
         else:
@@ -519,6 +521,6 @@ if __name__ == '__main__':
             smbnamedomain = smbdomain+'/'+smbname
         else:
             smbnamedomain = ''
-        os = format_os(smbos)
-        print( '{mac} {ipv4:<15} {smbnamedomain:<13} \t{ipv6}\t*{os}'.format(**locals()))
+        op_sys = format_os(smbos)
+        print( '{mac} {ipv4:<15} {smbnamedomain:<13} \t{ipv6}\t*{op_sys}'.format(**locals()))
 

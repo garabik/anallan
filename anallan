@@ -523,7 +523,7 @@ if __name__ == '__main__':
     machines_table = sorted(machines_table, key=lambda x: ip_sort_key(x[1]))
 
     def format_os(os):
-        return os.replace('Windows 7', 'W7').replace('Service Pack ', 'SP').replace('Professional', 'Prof')
+        return os.replace('Windows 7', 'W7').replace('Service Pack ', 'SP').replace('Professional', 'Prof').replace('Windows', 'Win')
 
     print ( '      mac        |     ipv4      |  smbname/wgrp    | ipv6 | *os ')
     print('-'*40)
